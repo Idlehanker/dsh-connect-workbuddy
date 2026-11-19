@@ -79,6 +79,7 @@ import {
 } from './channel-continue.ts'
 import type { WorkBuddyAdapter, ForeignThinkingBlock } from './adapter.ts'
 import { createWorkBuddyShim } from './shim.ts'
+import { startStableGateway, type StableGateway } from './stable-gateway.ts'
 import { MEDIA_MODEL_TTL_MS, registerWorkBuddyImageTool, type ToolsServiceLike } from './image-tool.ts'
 import { registerWorkBuddyVideoTool } from './video-tool.ts'
 import { IMAGE_TAG_TEXT_TO_IMAGE } from './image-gen.ts'
@@ -4628,9 +4629,14 @@ export function apply(ctx: Context, config: Config): void {
 
   let stopped = false
   let heartbeatWrite: Promise<WorkBuddyHostHeartbeatOwner | undefined> | undefined
+  let stableGateway: StableGateway | undefined
 
   ctx.effect(() => async () => {
     stopped = true
+    if (stableGateway !== undefined) {
+      try { await stableGateway.close() } catch { /* already closed */ }
+      stableGateway = undefined
+    }
     for (const region of REGION_KEYS) void stacks[region].shim.close()
     // A write already in progress settles before its own receipt is removed.
     // Startup failures that never wrote have no heartbeat to clear.
@@ -4641,6 +4647,24 @@ export function apply(ctx: Context, config: Config): void {
   void Promise.all(REGION_KEYS.map(region => stacks[region].shim.ready))
     .then(async () => {
       if (stopped) return
+
+      try {
+        stableGateway = startStableGateway({
+          shims: { cn: stacks.cn.shim, global: stacks.global.shim },
+          logger: ctx.logger,
+        })
+        if (stableGateway !== undefined) await stableGateway.ready
+      } catch (error) {
+        ctx.logger.warn('dsh-connect-workbuddy: stable gateway failed to start', error)
+        stableGateway = undefined
+      }
+      if (stopped) {
+        if (stableGateway !== undefined) {
+          try { await stableGateway.close() } catch { /* already closed */ }
+          stableGateway = undefined
+        }
+        return
+      }
 
       const adapters = {} as Record<WorkBuddyRegion, WorkBuddyAdapter>
       // The host services that can fold history are optional: a host without the
